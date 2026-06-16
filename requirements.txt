@@ -1,0 +1,14 @@
+docling>=2.0
+docling-core[chunking]
+typer>=0.12
+rich>=13.0
+pandas>=2.0
+Pillow>=10.0
+easyocr
+
+# dev
+pytest>=8.0
+pytest-mock>=3.14
+
+# optional
+openpyxl>=3.1

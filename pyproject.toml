@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "parsling"
+version = "0.1.0"
+description = "A robust PDF parser built on Docling for complex financial and government report layouts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["pdf", "parser", "docling", "financial", "ocr", "document"]
+
+dependencies = [
+    "docling>=2.0",
+    "docling-core[chunking]",
+    "typer>=0.12",
+    "rich>=13.0",
+    "pandas>=2.0",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+excel = ["openpyxl>=3.1"]
+dev = ["pytest>=8.0", "pytest-mock>=3.14"]
+
+[project.scripts]
+parsling = "parsling.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["parsling"]
