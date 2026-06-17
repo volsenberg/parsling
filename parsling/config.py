@@ -96,10 +96,22 @@ class ParseProfile:
     artifacts_path:
         Optional path to a local directory with pre-downloaded model
         weights. Set this for air-gapped / offline environments.
+
+    vlm_prompt:
+        Only used when ``use_vlm=True``. Overrides Granite-Docling's
+        default instruction ("Convert this page to docling."). Docling
+        supports this (it's a plain prompt string sent to the model), but
+        in testing on this project's documents, adding a language hint
+        ("the document is written in Indonesian...") did NOT fix the
+        small model's tendency to hallucinate individual words during
+        generation — the same garbled word reproduced with or without
+        the hint. Treat this as a low-confidence lever, not a reliable
+        fix for transcription accuracy.
     """
 
     # VLM switch
     use_vlm: bool = False
+    vlm_prompt: str | None = None
 
     # OCR
     do_ocr: bool = True

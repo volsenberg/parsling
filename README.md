@@ -106,9 +106,24 @@ print(md)
 ### VLM Profile (Granite-Docling-258M)
 
 ```python
-parser = PdfParser(profile="vlm")
+parser = PdfParser(profile="vlm", device="cuda")  # CPU by default — pass device="cuda" for GPU
 doc = parser.parse("complex_layout.pdf")
 print(DocExporter(doc).to_markdown())
+```
+
+```bash
+parsling convert complex_layout.pdf --profile vlm --device cuda
+```
+
+> **GPU note:** `--device` defaults to `cpu` for every profile, VLM included — pass `--device cuda` explicitly. In testing this was ~3.5x faster (12s/page vs ~42s/page on CPU for Granite-Docling-258M).
+
+> **VLM accuracy caveat:** unlike the OCR pipelines, the VLM is a small *generative* model — it occasionally hallucinates individual words during decoding (confirmed against ground truth: e.g. "dua puluh persen" → "dua puhul persen", "tunai" → "tuname"). This is silent corruption, not a visibly broken sentence, so it's a real risk for legal/financial documents where exact wording matters. The `accurate`/`fast` OCR profiles don't have this failure mode (their errors tend to be structural — page splits, fused blocks — which the rich-markdown recovery heuristics can detect and patch; word-level hallucination has no structural signature to catch).
+
+You can override the VLM's default instruction prompt via `vlm_prompt=` (Python) or `--vlm-prompt` (CLI) — e.g. to add domain or language context. In testing, adding an Indonesian-language hint did **not** fix the hallucination above (same garbled word reproduced on the identical page with or without the hint), so treat this as a low-confidence lever rather than an accuracy fix:
+
+```bash
+parsling convert complex_layout.pdf --profile vlm --device cuda \
+    --vlm-prompt "Convert this page to docling. The document is in Indonesian."
 ```
 
 ### Batch Conversion

@@ -418,7 +418,10 @@ def _build_rich_markdown(
     # -----------------------------------------------------------------------
     # Frontmatter
     # -----------------------------------------------------------------------
-    origin = raw.get("origin", {})
+    # The VLM pipeline doesn't populate "origin" (it's null, not a dict,
+    # unlike the standard OCR pipeline) — fall back to an empty dict so
+    # the frontmatter can still render a document name.
+    origin = raw.get("origin") or {}
     pages = raw.get("pages", {})
     page_count = len(pages) if isinstance(pages, dict) else 0
 

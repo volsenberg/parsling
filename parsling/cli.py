@@ -311,6 +311,14 @@ def convert(
              "as cropped images but not converted to tabular data. Use this on "
              "limited-VRAM GPUs alongside --no-formula-enrichment.",
     ),
+    vlm_prompt: Optional[str] = typer.Option(
+        None,
+        "--vlm-prompt",
+        help="[vlm profile only] Override Granite-Docling's default instruction "
+             "('Convert this page to docling.'). Note: in testing, adding a "
+             "language hint did not fix the model's word-level hallucinations — "
+             "treat this as a low-confidence lever, not an accuracy fix.",
+    ),
     formats: str = typer.Option(
         "json",
         "--to",
@@ -440,6 +448,7 @@ def convert(
             do_formula_enrichment=not no_formula_enrichment,
             do_code_enrichment=not no_formula_enrichment,
             do_chart_extraction=not no_chart_extraction,
+            vlm_prompt=vlm_prompt,
         )
         doc = _parse_with_progress(parser, path, pr, total_pages)
 

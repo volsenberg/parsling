@@ -174,9 +174,11 @@ def _build_standard_converter(profile: ParseProfile) -> DocumentConverter:
 
 def _build_vlm_converter(profile: ParseProfile) -> DocumentConverter:
     """Build a DocumentConverter using VlmPipeline with Granite-Docling-258M."""
-    pipeline_options = VlmPipelineOptions(
-        vlm_options=vlm_model_specs.GRANITEDOCLING_TRANSFORMERS,
-    )
+    vlm_options = vlm_model_specs.GRANITEDOCLING_TRANSFORMERS
+    if profile.vlm_prompt:
+        vlm_options = vlm_options.model_copy(update={"prompt": profile.vlm_prompt})
+
+    pipeline_options = VlmPipelineOptions(vlm_options=vlm_options)
     pipeline_options.accelerator_options = _build_accelerator(profile)
 
     return DocumentConverter(
@@ -228,6 +230,7 @@ class PdfParser:
         do_formula_enrichment: bool | None = None,
         do_code_enrichment: bool | None = None,
         do_chart_extraction: bool | None = None,
+        vlm_prompt: str | None = None,
     ) -> None:
         self.profile = _resolve_profile(profile)
         if device is not None:
@@ -240,6 +243,8 @@ class PdfParser:
             self.profile = replace(self.profile, do_code_enrichment=do_code_enrichment)
         if do_chart_extraction is not None:
             self.profile = replace(self.profile, do_chart_extraction=do_chart_extraction)
+        if vlm_prompt is not None:
+            self.profile = replace(self.profile, vlm_prompt=vlm_prompt)
         _apply_perf_settings(self.profile)
         self._converter = (
             _build_vlm_converter(self.profile)
