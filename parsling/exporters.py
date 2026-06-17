@@ -329,9 +329,11 @@ class DocExporter:
                     continue
                 # Annotate filename with classification label if available
                 label = "figure"
-                if picture.annotations:
-                    label = picture.annotations[0].predicted_class or "figure"
-                    label = label.lower().replace(" ", "_")
+                for ann in picture.annotations:
+                    if getattr(ann, "kind", None) == "classification" and ann.predicted_classes:
+                        top = max(ann.predicted_classes, key=lambda c: c.confidence)
+                        label = top.class_name.lower().replace(" ", "_")
+                        break
                 p = img_dir / f"{stem}_{label}_{i + 1:02d}.png"
                 img.save(p, format="PNG")
                 saved += 1
@@ -366,19 +368,40 @@ def _build_rich_markdown(
         for item in raw.get(collection, []):
             ref_map[item["self_ref"]] = item
 
-    # Ordered list of body refs (preserves reading order).
-    # Raw JSON uses "$ref"; after model_dump_json() round-trip Docling uses "cref".
-    body_refs: list[str] = [
-        c.get("$ref") or c.get("cref", "")
-        for c in raw.get("body", {}).get("children", [])
-    ]
+    # Flatten the body tree into reading order, recursing into group
+    # containers (e.g. "list", "key_value_area"). DoclingDocument nests
+    # list_items one level down inside a "list" group rather than placing
+    # them directly under body.children, so a flat walk over body.children
+    # alone silently drops every enumerated item (numbered/lettered
+    # paragraphs — e.g. "Pasal" clauses in Indonesian regulations, or any
+    # ordered/bulleted list in other document types). Recursing handles
+    # both flat and arbitrarily nested lists generically, regardless of
+    # document type.
+    list_depth: dict[str, int] = {}
+
+    def _flatten(children: list, ref_map: dict, depth: int) -> list[str]:
+        out: list[str] = []
+        for c in children:
+            ref = c.get("$ref") or c.get("cref", "")
+            item = ref_map.get(ref)
+            if item is None:
+                continue
+            if ref.startswith("#/groups/"):
+                child_depth = depth + 1 if item.get("label") == "list" else depth
+                out.extend(_flatten(item.get("children", []), ref_map, child_depth))
+            else:
+                list_depth[ref] = depth
+                out.append(ref)
+        return out
+
+    body_refs: list[str] = _flatten(raw.get("body", {}).get("children", []), ref_map, 0)
 
     # Pre-index caption positions for fast window lookups.
     caption_positions: dict[int, str] = {}
     for pos, ref in enumerate(body_refs):
         item = ref_map.get(ref, {})
         if item.get("label") == "caption":
-            caption_positions[pos] = item.get("text", "")
+            caption_positions[pos] = _dedupe_repeated_phrases(item.get("text", ""))
 
     # -----------------------------------------------------------------------
     # Pre-pass: detect and merge page-split tables
@@ -413,7 +436,10 @@ def _build_rich_markdown(
     # Walk body in order
     # -----------------------------------------------------------------------
     section_stack: list[str] = []
+    kind_depth: dict[str, int] = {}
     table_counter = 0
+    last_para_line: int | None = None
+    last_para_top: float | None = None
 
     def _breadcrumb() -> str:
         return " > ".join(s for s in section_stack if s)
@@ -421,6 +447,11 @@ def _build_rich_markdown(
     def _page(item: dict) -> int | str:
         prov = item.get("prov") or []
         return prov[0].get("page_no", "?") if prov else "?"
+
+    def _top(item: dict) -> float | None:
+        """Bbox top (BOTTOMLEFT origin: larger = physically higher on the page)."""
+        prov = item.get("prov") or []
+        return prov[0].get("bbox", {}).get("t") if prov else None
 
     def _find_caption(pos: int) -> str | None:
         for delta in range(1, caption_window + 1):
@@ -434,11 +465,42 @@ def _build_rich_markdown(
             return ""
         rows: list[str] = []
         for r, row in enumerate(grid):
-            cells = [cell.get("text", "").replace("|", "\\|").replace("\n", " ") for cell in row]
+            cells = [
+                _dedupe_repeated_phrases(cell.get("text", "")).replace("|", "\\|").replace("\n", " ")
+                for cell in row
+            ]
             rows.append("| " + " | ".join(cells) + " |")
             if r == 0:
                 rows.append("| " + " | ".join("---" for _ in row) + " |")
         return "\n".join(rows)
+
+    # Collapse consecutive uncaptioned figures (e.g. decorative icons/logos
+    # repeated across a page) into a single summary line instead of one
+    # placeholder block per picture.
+    picture_group_size: dict[int, int] = {}
+    picture_skip_pos: set[int] = set()
+    pos_i = 0
+    while pos_i < len(body_refs):
+        cur = ref_map.get(body_refs[pos_i])
+        if cur and cur.get("label") == "picture" and not _find_caption(pos_i):
+            run_page = _page(cur)
+            run_end = pos_i
+            while run_end < len(body_refs):
+                nxt = ref_map.get(body_refs[run_end])
+                if (
+                    not nxt
+                    or nxt.get("label") != "picture"
+                    or _find_caption(run_end)
+                    or _page(nxt) != run_page
+                ):
+                    break
+                run_end += 1
+            if run_end - pos_i > 1:
+                picture_group_size[pos_i] = run_end - pos_i
+                picture_skip_pos.update(range(pos_i + 1, run_end))
+            pos_i = run_end if run_end > pos_i else pos_i + 1
+        else:
+            pos_i += 1
 
     for pos, ref in enumerate(body_refs):
         item = ref_map.get(ref)
@@ -458,14 +520,16 @@ def _build_rich_markdown(
 
         # --- Section headers ---
         if label == "section_header":
-            text = item.get("text", "").strip()
+            text = _dedupe_repeated_phrases(item.get("text", "").strip())
             if not text:
                 continue
-            depth = _heading_depth(text, section_stack)
+            depth = _heading_depth(text, section_stack, kind_depth)
             section_stack = section_stack[: depth - 1] + [text]
             hashes = "#" * min(depth + 1, 6)
             lines.append(f"\n{hashes} {text}")
             lines.append(f"<!-- section page={page} depth={depth} -->")
+            last_para_line = None
+            last_para_top = None
             continue
 
         # --- Caption (rendered inline next to its table/figure) ---
@@ -512,45 +576,157 @@ def _build_rich_markdown(
             else:
                 lines.append("<!-- table grid not available -->")
             lines.append("")
+            last_para_line = None
+            last_para_top = None
             continue
 
         # --- Pictures ---
         if label == "picture":
             if not include_pictures:
                 continue
+            if pos in picture_skip_pos:
+                continue
             caption = _find_caption(pos) or ""
             breadcrumb = _breadcrumb()
             lines.append("")
-            lines.append(
-                "<!-- FIGURE: page="
-                + str(page)
-                + (f', section="{breadcrumb}"' if breadcrumb else "")
-                + (f', caption="{caption}"' if caption else "")
-                + " -->"
-            )
+            group_size = picture_group_size.get(pos)
+            if group_size:
+                lines.append(
+                    f"<!-- {group_size} FIGURES: page={page}"
+                    + (f', section="{breadcrumb}"' if breadcrumb else "")
+                    + " -->"
+                )
+            else:
+                lines.append(
+                    "<!-- FIGURE: page="
+                    + str(page)
+                    + (f', section="{breadcrumb}"' if breadcrumb else "")
+                    + (f', caption="{caption}"' if caption else "")
+                    + " -->"
+                )
             if caption:
                 lines.append(f"*{caption}*")
                 lines.append("")
+            last_para_line = None
+            last_para_top = None
             continue
 
         # --- List items ---
         if label == "list_item":
-            text = item.get("text", "").strip()
+            text = _dedupe_repeated_phrases(item.get("text", "").strip())
             if text:
-                lines.append(f"- {text}")
+                marker = (item.get("marker") or "").strip()
+                # Only an unmarked item can be a page-split continuation
+                # fragment — a real sibling item (huruf/ayat) always carries
+                # its own marker even if its text happens to start with a
+                # lowercase word, so markers must never be merged away.
+                if (
+                    not marker
+                    and last_para_line is not None
+                    and _looks_like_continuation(text)
+                ):
+                    lines[last_para_line] = lines[last_para_line].rstrip() + " " + text
+                else:
+                    depth = list_depth.get(ref, 0)
+                    indent = "  " * max(depth - 1, 0)
+                    bullet = marker if (marker and marker != "-") else "-"
+                    # CommonMark joins consecutive non-blank lines into one
+                    # paragraph (soft line breaks render as spaces in most
+                    # viewers), so without a blank line every ayat/huruf
+                    # clause would visually collapse into a single block
+                    # even though the raw text has them on separate lines.
+                    if lines and lines[-1] != "":
+                        lines.append("")
+                    lines.append(f"{indent}{bullet} {text}")
+                    last_para_line = len(lines) - 1
+                    last_para_top = _top(item)
             continue
 
         # --- Footnotes ---
         if label == "footnote":
-            text = item.get("text", "").strip()
+            text = _dedupe_repeated_phrases(item.get("text", "").strip())
             if text:
                 lines.append(f"\n> [^fn] {text}")
+            last_para_line = None
+            last_para_top = None
             continue
 
         # --- Body text ---
         if label == "text":
-            text = item.get("text", "").strip()
+            text = _dedupe_repeated_phrases(item.get("text", "").strip())
             if not text or len(text) < min_text_len:
+                continue
+
+            # Recover a heading fused onto unrelated text by the source
+            # extraction (see _split_embedded_heading). The remainder is
+            # almost always the tail of whatever paragraph/clause was being
+            # rendered just before this item, so it reattaches there rather
+            # than dangling as an orphan fragment. The heading itself
+            # usually belongs *before* that paragraph (the source PDF had
+            # it positioned above the paragraph it got fused into) — bbox
+            # top tells us which: a higher top means physically higher on
+            # the page (BOTTOMLEFT origin), so insert there instead of
+            # appending after when that's the case.
+            heading, remainder = _split_embedded_heading(text)
+            if heading:
+                prev_para_line = last_para_line
+                prev_para_top = last_para_top
+                heading_top = _top(item)
+                depth = _heading_depth(heading, section_stack, kind_depth)
+                section_stack = section_stack[: depth - 1] + [heading]
+                hashes = "#" * min(depth + 1, 6)
+                heading_block = [
+                    f"{hashes} {heading}",
+                    f"<!-- section page={page} depth={depth} recovered_from=merged-text -->",
+                ]
+
+                belongs_before_prev = (
+                    prev_para_line is not None
+                    and heading_top is not None
+                    and prev_para_top is not None
+                    and heading_top > prev_para_top + 1.0  # tolerance for float jitter
+                )
+
+                if belongs_before_prev:
+                    block = (
+                        ([] if lines[prev_para_line - 1:prev_para_line] == [""] else [""])
+                        + heading_block
+                        + [""]
+                    )
+                    lines[prev_para_line:prev_para_line] = block
+                    shifted_para_line = prev_para_line + len(block)
+                    if remainder:
+                        lines[shifted_para_line] = lines[shifted_para_line].rstrip() + " " + remainder
+                    last_para_line = shifted_para_line
+                    last_para_top = prev_para_top
+                else:
+                    if lines and lines[-1] != "":
+                        lines.append("")
+                    lines.extend(heading_block)
+                    if remainder:
+                        if prev_para_line is not None:
+                            lines[prev_para_line] = lines[prev_para_line].rstrip() + " " + remainder
+                            last_para_line = prev_para_line
+                            last_para_top = prev_para_top
+                        else:
+                            lines.append("")
+                            lines.append(remainder)
+                            lines.append(f"<!-- text page={page} -->")
+                            last_para_line = len(lines) - 2
+                            last_para_top = heading_top
+                    else:
+                        last_para_line = None
+                        last_para_top = None
+                continue
+
+            # A page break can split one paragraph or list clause into two
+            # body items: the tail re-enters as a plain "text" item (outside
+            # any list group) instead of staying attached to the item it
+            # continues. If it looks like a sentence fragment (starts
+            # lowercase, no preceding blank-line reset), append it to the
+            # previous line instead of starting a new paragraph block.
+            if last_para_line is not None and _looks_like_continuation(text):
+                lines[last_para_line] = lines[last_para_line].rstrip() + " " + text
                 continue
             breadcrumb = _breadcrumb()
             lines.append("")
@@ -561,13 +737,9 @@ def _build_rich_markdown(
                 + (f' section="{breadcrumb}"' if breadcrumb else "")
                 + " -->"
             )
+            last_para_line = len(lines) - 2
+            last_para_top = _top(item)
             continue
-
-        # --- key_value_area groups (pass-through) ---
-        if label == "key_value_area":
-            text = item.get("text", "").strip()
-            if text:
-                lines.append(f"\n> {text}")
 
     return "\n".join(lines) + "\n"
 
@@ -650,18 +822,103 @@ def _detect_and_merge(
         i = j if chain_absorbed else i + 1
 
 
-def _heading_depth(text: str, stack: list[str]) -> int:
+_EMBEDDED_HEADING_RE = re.compile(r"^((?:[A-Z]{2,}\s+){2,}[A-Z]{2,})\s+(\S.*)$")
+
+
+def _split_embedded_heading(text: str) -> tuple[str | None, str]:
+    """
+    Detect an ALL-CAPS heading fused as a prefix onto unrelated body text.
+
+    Some PDF layout/OCR extraction merges a short heading-like line (e.g. a
+    caption sitting directly above a paragraph) with text from a completely
+    different line into one block, because their bounding boxes were
+    clustered together. The merged string then reads like
+    "SOME HEADING restofsentence..." with no whitespace/structure left to
+    tell them apart except the ALL-CAPS run.
+
+    A plain "ALL-CAPS run followed by a non-all-caps word" is NOT enough to
+    call this a merge artifact — most regulation titles are themselves one
+    long all-caps sentence that legitimately ends in a lowercase-adjacent
+    token like "UMUM.", "Indonesia,", or a trailing number ("...TAHUN 2026
+    NOMOR"), and naive splitting there mangles a perfectly good title (this
+    previously corrupted a person's name by fusing it with an unrelated
+    trailing fragment — see tests). Only split when the remainder also
+    carries a positive signal that it's resuming a *different* sentence
+    already in progress: it starts mid-clause (lowercase) or closes
+    something the heading itself never opened (a word immediately followed
+    by ``)``, e.g. a clause like "PKSOP4D)" finishing a formula whose "("
+    is in the preceding paragraph).
+    """
+    m = _EMBEDDED_HEADING_RE.match(text)
+    if not m:
+        return None, text
+    heading, remainder = m.group(1).strip(), m.group(2)
+    first_word = remainder.split(" ", 1)[0]
+    if first_word.isalpha() and first_word.isupper():
+        # Remainder still looks like part of the same all-caps phrase —
+        # this is a real (long) heading, not a merge artifact.
+        return None, text
+    if not (first_word[:1].islower() or re.match(r"^\S+\)", first_word)):
+        return None, text
+    return heading, remainder
+
+
+def _looks_like_continuation(text: str) -> bool:
+    """A lowercase-leading fragment is almost certainly the tail of a
+    sentence/clause split across a page break, not a new paragraph."""
+    return bool(text) and text[0].islower()
+
+
+def _dedupe_repeated_phrases(text: str, max_phrase_len: int = 8) -> str:
+    """
+    Collapse immediately-adjacent repeated word runs.
+
+    Some scanned/overlapping PDF titles get OCR'd twice into one text item
+    (e.g. "RCE RCE Kajian Fiskal Regional Kajian Fiskal Regional" -> the
+    title rendered twice in the same bbox). Greedily collapse the longest
+    repeated phrase first so multi-word duplicates aren't left half-fixed.
+    """
+    words = text.split()
+    n = len(words)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        matched = False
+        max_len = min(max_phrase_len, (n - i) // 2)
+        for length in range(max_len, 0, -1):
+            if words[i:i + length] == words[i + length:i + 2 * length]:
+                out.extend(words[i:i + length])
+                i += 2 * length
+                matched = True
+                break
+        if not matched:
+            out.append(words[i])
+            i += 1
+    return " ".join(out)
+
+
+def _heading_depth(text: str, stack: list[str], kind_depth: dict[str, int]) -> int:
     """
     Infer Markdown heading depth (1-based) from the text content.
 
     Priority order:
     1. Leading numeric outline prefix (e.g. "1.2.3 Title" → depth 3).
     2. ALL-CAPS short text with no sub-section below → treat as depth 1.
-    3. Fall back to current stack depth + 1 (continuation), capped at 4.
+    3. Repeated heading "kind" (leading word, e.g. "Pasal", "BAB", "Article",
+       "Chapter") reuses the depth assigned the first time that kind was
+       seen, so a sequence of siblings (Pasal 1, Pasal 2, ... Pasal 117)
+       stays flat instead of nesting one level deeper on every occurrence.
+    4. Fall back to current stack depth + 1 (continuation), capped at 4.
     """
     m = re.match(r"^(\d+(?:\.\d+)*)\s", text)
     if m:
         return len(m.group(1).split("."))
     if text == text.upper() and len(text) < 60:
         return 1
-    return min(len(stack) + 1, 4)
+    kind_match = re.match(r"^([A-Za-z]+)\b", text)
+    kind = kind_match.group(1).upper() if kind_match else text[:20].upper()
+    if kind in kind_depth:
+        return kind_depth[kind]
+    depth = min(len(stack) + 1, 4)
+    kind_depth[kind] = depth
+    return depth

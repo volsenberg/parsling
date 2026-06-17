@@ -12,12 +12,19 @@ Commands
 
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
+import os
 import queue
 import re
 import threading
 from pathlib import Path
+
+# Must be set before CUDA is initialized (i.e. before torch is imported by
+# docling), so it has to happen at module import time, not inside a command.
+# Reduces VRAM fragmentation that can turn a "should fit" allocation into an OOM.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from typing import Optional
 
 import typer
@@ -34,6 +41,10 @@ from rich.progress import (
 from rich.table import Table
 from rich import print as rprint
 
+from dotenv import load_dotenv
+
+load_dotenv()  # picks up HF_TOKEN (and friends) from a local .env file, if present
+
 app = typer.Typer(
     name="parsling",
     help="PDF parser built on Docling — for complex financial and government report layouts.",
@@ -43,6 +54,7 @@ console = Console()
 
 _PROFILE_CHOICES = ["fast", "accurate", "vlm"]
 _FORMAT_CHOICES = ["md", "rich_md", "json", "html", "csv", "doctags"]
+_DEVICE_CHOICES = ["cpu", "cuda", "mps"]
 
 from rich.logging import RichHandler
 
@@ -59,6 +71,9 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logging.getLogger("pdfminer").setLevel(logging.WARNING)
 logging.getLogger("onnxruntime").setLevel(logging.ERROR)
 logging.getLogger("docling.models.stages.ocr.tesseract_ocr_cli_model").setLevel(logging.CRITICAL)
+# One INFO line per picture annotation migrated to the new `meta` format —
+# pure noise, not actionable (docling_core internal schema migration).
+logging.getLogger("docling_core.types.doc.document").setLevel(logging.WARNING)
 
 
 def _count_pdf_pages(path: Path) -> int:
@@ -268,6 +283,34 @@ def convert(
         "--output", "-o",
         help="Output directory.",
     ),
+    device: str = typer.Option(
+        "cpu",
+        "--device", "-d",
+        help=f"Accelerator device: {_DEVICE_CHOICES}. Use 'cuda' if you have an NVIDIA GPU — "
+             "dramatically faster for OCR, TableFormer, and chart extraction.",
+    ),
+    batch_size: int = typer.Option(
+        4,
+        "--batch-size",
+        min=1,
+        help="Pages processed together per batch through OCR/layout/table models. "
+             "Lower this (e.g. 1 or 2) on GPUs with limited VRAM to avoid CUDA OOM "
+             "with --device cuda. Higher = more throughput, more peak memory.",
+    ),
+    no_formula_enrichment: bool = typer.Option(
+        False,
+        "--no-formula-enrichment",
+        help="Disable CodeFormulaV2 formula/code enrichment. Frees GPU VRAM — "
+             "useful on limited-VRAM GPUs if your document has no math/code blocks.",
+    ),
+    no_chart_extraction: bool = typer.Option(
+        False,
+        "--no-chart-extraction",
+        help="Disable the Granite Vision chart-extraction model (~4-5GB VRAM, the "
+             "single largest GPU consumer in the accurate profile). Charts are kept "
+             "as cropped images but not converted to tabular data. Use this on "
+             "limited-VRAM GPUs alongside --no-formula-enrichment.",
+    ),
     formats: str = typer.Option(
         "json",
         "--to",
@@ -375,17 +418,29 @@ def convert(
         rprint(f"[red]Unknown profile {profile!r}. Choose from: {_PROFILE_CHOICES}[/red]")
         raise typer.Exit(1)
 
+    device = device.lower()
+    if device not in _DEVICE_CHOICES:
+        rprint(f"[red]Unknown device {device!r}. Choose from: {_DEVICE_CHOICES}[/red]")
+        raise typer.Exit(1)
+
     if path.suffix.lower() == ".json":
         console.print(f"\n[bold cyan]parsling[/bold cyan] · loading structured JSON · {path.name}\n")
         from docling_core.types.doc import DoclingDocument
         with console.status(f"[bold green]Loading {path.name}…"):
             doc = DoclingDocument.load_from_json(path)
     else:
-        console.print(f"\n[bold cyan]parsling[/bold cyan] · profile=[yellow]{profile}[/yellow] · {path.name}\n")
+        console.print(f"\n[bold cyan]parsling[/bold cyan] · profile=[yellow]{profile}[/yellow] · device=[yellow]{device}[/yellow] · {path.name}\n")
         total_pages = _count_pdf_pages(path)
         if total_pages:
             console.print(f"[dim]  {total_pages} pages detected[/dim]\n")
-        parser = PdfParser(profile=profile)
+        parser = PdfParser(
+            profile=profile,
+            device=device,
+            page_batch_size=batch_size,
+            do_formula_enrichment=not no_formula_enrichment,
+            do_code_enrichment=not no_formula_enrichment,
+            do_chart_extraction=not no_chart_extraction,
+        )
         doc = _parse_with_progress(parser, path, pr, total_pages)
 
     exporter = DocExporter(doc)
@@ -430,6 +485,18 @@ def convert(
 def batch(
     folder: Path = typer.Argument(Path("./input"), help="Folder containing PDF files. Default: ./input"),
     profile: str = typer.Option("accurate", "--profile", "-p"),
+    device: str = typer.Option(
+        "cpu",
+        "--device", "-d",
+        help=f"Accelerator device: {_DEVICE_CHOICES}.",
+    ),
+    batch_size: int = typer.Option(
+        4,
+        "--batch-size",
+        min=1,
+        help="Pages processed together per batch through OCR/layout/table models. "
+             "Lower this (e.g. 1 or 2) on GPUs with limited VRAM to avoid CUDA OOM.",
+    ),
     output: Path = typer.Option(Path("./output"), "--output", "-o"),
     formats: str = typer.Option("json", "--to"),
     glob: str = typer.Option("**/*.pdf", "--glob", help="Glob pattern for PDF discovery."),
@@ -461,10 +528,14 @@ def batch(
         rprint("[yellow]Batch process only supports outputting JSON format. To get other formats, convert the individual JSON files.[/yellow]")
         raise typer.Exit(1)
     profile = profile.lower()
+    device = device.lower()
+    if device not in _DEVICE_CHOICES:
+        rprint(f"[red]Unknown device {device!r}. Choose from: {_DEVICE_CHOICES}[/red]")
+        raise typer.Exit(1)
 
-    console.print(f"\n[bold cyan]parsling batch[/bold cyan] · profile=[yellow]{profile}[/yellow] · {folder}\n")
+    console.print(f"\n[bold cyan]parsling batch[/bold cyan] · profile=[yellow]{profile}[/yellow] · device=[yellow]{device}[/yellow] · {folder}\n")
 
-    parser = PdfParser(profile=profile)
+    parser = PdfParser(profile=profile, device=device, page_batch_size=batch_size)
     success = fail = 0
     any_processed = False
 
@@ -538,6 +609,158 @@ def info(
             console.print(f"\n  [yellow]Table {i + 1}[/yellow] — {df.shape[0]} rows × {df.shape[1]} cols")
             console.print(df.head(3).to_string(index=False))
     console.print()
+
+
+# -----------------------------------------------------------------------
+# verify
+# -----------------------------------------------------------------------
+
+@app.command()
+def verify(
+    json_path: Path = typer.Argument(..., help="Path to the parsed DoclingDocument JSON."),
+    pdf: Optional[Path] = typer.Option(
+        None,
+        "--pdf",
+        help="Path to the original source PDF. Required when --llm is passed.",
+    ),
+    llm: bool = typer.Option(
+        False,
+        "--llm",
+        help=(
+            "Opt in to the vision-LLM pass on flagged pages (costs money, needs network "
+            "+ an API key). Off by default — parsling works fully offline without it; "
+            "the free heuristic triage runs either way."
+        ),
+    ),
+    model: str = typer.Option(
+        "gpt-5.4-nano",
+        "--model",
+        help="Vision-capable model name (OpenAI-compatible chat completions API). Only used with --llm.",
+    ),
+    base_url: str = typer.Option(
+        "https://api.openai.com/v1",
+        "--base-url",
+        help="OpenAI-compatible API base URL.",
+    ),
+    api_key: Optional[str] = typer.Option(
+        None,
+        "--api-key",
+        help="Defaults to $OPENAI_API_KEY, then $DEEPSEEK_API_KEY (.env is loaded automatically).",
+    ),
+    max_pages: Optional[int] = typer.Option(
+        None,
+        "--max-pages",
+        min=1,
+        help="Cap how many flagged pages are sent to the model — cost control.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output", "-o",
+        help="Save the verification report as JSON to this path.",
+    ),
+) -> None:
+    """
+    Flag suspect pages with a free metadata triage, optionally verify them with a vision LLM.
+
+    Stage 1 (free, always runs, fully offline): scans the DoclingDocument
+    JSON metadata for known extraction-artifact patterns (embedded
+    headings, page-split fragments, empty table grids) — no network call,
+    no API key needed.
+
+    Stage 2 (paid, opt in via --llm): renders each flagged page from the
+    original PDF and asks a vision-capable LLM to check the extracted text
+    against the page image. parsling works fully offline without this —
+    it's an optional add-on for when you want a second opinion on the
+    pages the free triage already narrowed down.
+    """
+    from parsling.verify import flag_pages, verify_document
+
+    json_path = _resolve_input(json_path)
+    if not json_path.exists():
+        rprint(f"[red]File not found: {json_path}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold cyan]parsling verify[/bold cyan] · {json_path.name}\n")
+
+    raw = json.loads(json_path.read_text(encoding="utf-8"))
+    flags = flag_pages(raw)
+
+    if not flags:
+        rprint("[green]No suspect pages found by heuristic triage.[/green]")
+        raise typer.Exit(0)
+
+    tbl = Table(title="Heuristic Triage (free)", show_header=True, header_style="bold yellow")
+    tbl.add_column("Page", style="cyan")
+    tbl.add_column("Reasons")
+    for page in sorted(flags):
+        tbl.add_row(str(page), "\n".join(flags[page]))
+    console.print(tbl)
+    console.print(f"\n[dim]{len(flags)} page(s) flagged[/dim]")
+
+    report: list[dict] = [{"page_no": p, "flags": flags[p]} for p in sorted(flags)]
+
+    if not llm:
+        if output:
+            output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            rprint(f"\n[green]Saved heuristic report → {output}[/green]")
+        rprint("\n[dim]Pass --llm (with --pdf) to also verify these pages against the source image.[/dim]")
+        raise typer.Exit(0)
+
+    if not pdf:
+        rprint("\n[red]--pdf is required when --llm is passed.[/red]")
+        raise typer.Exit(1)
+    pdf = _resolve_input(pdf)
+    if not pdf.exists():
+        rprint(f"[red]PDF not found: {pdf}[/red]")
+        raise typer.Exit(1)
+
+    n_checking = min(len(flags), max_pages) if max_pages else len(flags)
+    console.print(f"\n[bold cyan]Verifying {n_checking} flagged page(s) with {model}…[/bold cyan]\n")
+
+    try:
+        results = verify_document(
+            raw,
+            pdf,
+            flags=flags,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            max_pages=max_pages,
+        )
+    except ValueError as exc:
+        rprint(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    rtbl = Table(title="Vision Verification", show_header=True, header_style="bold magenta")
+    rtbl.add_column("Page", style="cyan")
+    rtbl.add_column("Status")
+    rtbl.add_column("Issues", justify="right")
+    for r in results:
+        style = {"ok": "green", "issues_found": "red"}.get(r.status, "yellow")
+        rtbl.add_row(str(r.page_no), f"[{style}]{r.status}[/{style}]", str(len(r.issues)))
+    console.print(rtbl)
+
+    for r in results:
+        if r.issues:
+            rprint(f"\n[bold red]Page {r.page_no}:[/bold red]")
+            for issue in r.issues:
+                desc = issue.get("description", str(issue)) if isinstance(issue, dict) else str(issue)
+                rprint(f"  • {desc}")
+        elif r.status == "error":
+            rprint(f"\n[yellow]Page {r.page_no}: verification error — {r.raw_response}[/yellow]")
+
+    if output:
+        full_report = [
+            {
+                "page_no": r.page_no,
+                "flags": r.flags,
+                "status": r.status,
+                "issues": r.issues,
+            }
+            for r in results
+        ]
+        output.write_text(json.dumps(full_report, indent=2, ensure_ascii=False), encoding="utf-8")
+        rprint(f"\n[green]Saved verification report → {output}[/green]")
 
 
 if __name__ == "__main__":

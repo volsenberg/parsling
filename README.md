@@ -18,8 +18,10 @@ Designed for multi-layout PDFs — Indonesian government annual reports, financi
 - **Granite-Docling-258M** end-to-end VLM pipeline (VLM profile)
 - **Live per-page progress bar** — shows current stage (Rendering → OCR → Layout → Tables → Assembling) during parsing
 - Export to Markdown, Rich Markdown, JSON, HTML/DocTags, CSV (per table), PNG figures
+- **Rich Markdown recovery heuristics** — repairs known Docling extraction artifacts (dropped list items, page-split sentence fragments, headings fused into body text, unstable heading nesting) so output stays readable across very different document types (financial reports, dense legal/regulatory text) without per-document tuning. See [Rich Markdown Format](#rich-markdown-format).
+- **Two-tier verification (`parsling verify`)** — free metadata-based triage to flag pages likely to have extraction artifacts, with an optional vision-LLM pass on just the flagged pages to catch what heuristics can't. See [Verification](#verification).
 - Batch conversion via `parse_folder()`
-- CLI: `parsling convert`, `parsling batch`, `parsling info`
+- CLI: `parsling convert`, `parsling batch`, `parsling info`, `parsling verify`
 
 ---
 
@@ -59,6 +61,12 @@ Install EasyOCR (required for the `accurate` profile — large download, ~1 GB):
 
 ```bash
 pip install easyocr
+```
+
+Optional — for `parsling verify`'s vision-LLM tier, add an API key to a `.env` file in the project root (loaded automatically):
+
+```bash
+OPENAI_API_KEY=sk-...
 ```
 
 ---
@@ -216,6 +224,18 @@ parsling convert report.json --to rich_md --caption-window 8
 parsling convert report.json --to rich_md --min-text 10
 ```
 
+### Step 3 (optional) — Verify extraction quality
+
+```bash
+# Free heuristic triage, fully offline — flags suspect pages, no network call, no API key
+parsling verify output/report_fast/report_fast.json
+
+# Opt in to a vision-LLM pass on the flagged pages (needs network + the original PDF + an API key)
+parsling verify output/report_fast/report_fast.json --llm --pdf report.pdf
+```
+
+The free triage is the default and requires nothing beyond the JSON you already have — parsling stays fully offline-capable. The vision-LLM tier is an opt-in add-on for when you have network access and want a second opinion on the pages the triage already narrowed down. See [Verification](#verification) below for details on what each tier checks and the cost/accuracy tradeoffs.
+
 ---
 
 ## Rich Markdown Format
@@ -267,6 +287,56 @@ Paragraph text here.
 <!-- text page=70 section="BAB III > 3.1 Pelaksanaan APBN" -->
 ```
 
+### Extraction-artifact recovery heuristics
+
+Docling's raw `body.children` tree doesn't always reflect true reading order or even keep related content together — the rich-markdown builder walks the actual document structure (not just a flat list) and applies a few generic recovery passes so different document types (dense financial reports, heavily list-structured legal/regulatory text) come out readable without per-document tuning:
+
+- **List-group flattening** — enumerated/lettered items (`a.`, `b.`, `(1)`, `(2)`, ...) live nested one level down inside `list` group containers, not directly under `body.children`. A flat walk silently drops everything inside them; the builder recurses into groups instead, preserving nesting depth and original markers.
+- **Heading depth by "kind"** — a naive depth heuristic pushes every repeated heading pattern (`Pasal 1`, `Pasal 2`, ... `Pasal 117`) one level deeper each time, since each new heading falls back to "current stack depth + 1". The builder tracks depth per heading *kind* (its leading word — `Pasal`, `BAB`, `Bagian`, etc.) so a sequence of siblings stays flat.
+- **Page-split continuation merging** — a page break can split one sentence or list clause into two separate body items. An unmarked list item or stray `text` item that looks like a sentence fragment (starts lowercase, no preceding section break) gets reattached to the paragraph it continues instead of rendering as a disconnected block.
+- **Embedded-heading recovery** — sometimes a short heading-like line (e.g. a caption sitting directly above a paragraph) gets fused with unrelated text from a different line into a single block, because their bounding boxes were clustered together by the layout model. The builder detects an ALL-CAPS heading run fused as a prefix onto otherwise unrelated text, splits it out as its own heading, and reattaches the remainder to the paragraph it actually continues — using each item's bbox position to insert the heading *before* or *after* that paragraph, matching its true position in the source PDF rather than wherever Docling happened to order it.
+- **Blank-line paragraph separation** — CommonMark joins consecutive non-blank lines into a single paragraph (soft line breaks collapse to spaces in most renderers). Every clause/list item is separated by a blank line so each one actually renders as its own paragraph or list item instead of collapsing into a wall of text.
+
+None of these are document-type-specific — they're driven by structural signals (group nesting, bbox position, marker presence, text case) that hold regardless of whether the source is a financial report or a legal/regulatory document.
+
+---
+
+## Verification
+
+Even with the recovery heuristics above, some extraction artifacts can't be confidently auto-fixed (Docling fusing two genuinely unrelated text regions with no recoverable boundary, OCR typos, truncated sentences). `parsling verify` is a two-tier check against the original PDF. **parsling is fully offline-capable** — the LLM tier is an optional add-on, never required.
+
+**Tier 1 — free heuristic triage** (`flag_pages()`, always runs, fully offline): scans the JSON metadata for known artifact signatures — no network call, no API key, no cost. Flags pages with:
+- an embedded heading still detected fused into body text
+- unmarked list items (possible page-split continuation fragments)
+- text that shrinks >30% after de-duplication (OCR repeat/garble)
+- tables with no grid data
+
+**Tier 2 — vision-LLM verification** (opt in via `--llm`, requires network + an API key, costs money): for only the pages Tier 1 flagged, renders that page from the original PDF and asks a vision-capable LLM to check the extracted text against the actual page image, reporting concrete discrepancies.
+
+```bash
+# Default: free triage only — no network, no API key, no cost
+parsling verify output/report_accurate/report_accurate.json
+
+# Opt in to the vision-LLM pass on flagged pages
+parsling verify output/report_accurate/report_accurate.json --llm --pdf input/report.pdf
+
+# Cap how many flagged pages get sent to the model (cost control)
+parsling verify output/report_accurate/report_accurate.json --llm --pdf input/report.pdf --max-pages 5
+
+# Save a JSON report
+parsling verify output/report_accurate/report_accurate.json --llm --pdf input/report.pdf -o verify_report.json
+
+# Use a different OpenAI-compatible vision model/provider
+parsling verify output/report_accurate/report_accurate.json --llm --pdf input/report.pdf \
+    --model gpt-4o --base-url https://api.openai.com/v1
+```
+
+The `--llm` tier requires an API key — defaults to `$OPENAI_API_KEY`, falling back to `$DEEPSEEK_API_KEY` (a `.env` file in the project root is loaded automatically). Default model is `gpt-5.4-nano` via OpenAI's API — chosen over `gpt-4o-mini` after head-to-head calibration on this project's documents showed fewer fabricated "issues" and more specific, accurate findings at a comparable cost.
+
+> **Note on provider choice:** DeepSeek's API does **not** currently accept image input on its chat completions endpoint — confirmed directly against the live API (every model name tested returns the same `unknown variant image_url` deserialization error), despite some third-party claims otherwise. Use an OpenAI-compatible provider that actually supports vision (OpenAI itself is the default and is verified working).
+
+> **Calibration caveat:** budget vision models are useful as a triage assistant, not an oracle. Even the better-calibrated `gpt-5.4-nano` still occasionally hallucinates an "issue" with no real discrepancy. `verify_document()` filters out the most obvious case (an issue whose `extracted_says` and `page_actually_says` are identical), but treat every reported issue as a candidate for manual review, not a confirmed bug.
+
 ---
 
 ## Output Structure
@@ -312,7 +382,8 @@ parsling/
 │   ├── config.py             # ParseProfile dataclass
 │   ├── profiles.py           # FAST, ACCURATE, VLM presets
 │   ├── converter.py          # PdfParser — core parsing engine
-│   ├── exporters.py          # DocExporter — all output formats + rich MD builder
+│   ├── exporters.py          # DocExporter — all output formats + rich MD builder + recovery heuristics
+│   ├── verify.py             # Two-tier verification: free heuristic triage + vision-LLM check
 │   └── cli.py                # Typer CLI with live progress bar
 ├── examples/
 │   ├── basic_usage.py
@@ -333,3 +404,7 @@ parsling/
 ```bash
 pytest tests/ -v
 ```
+
+`tests/test_rich_markdown.py` is a regression suite for the rich-markdown recovery heuristics, built from real extraction bugs found in production documents (a heading fused into a formula and rendered in the wrong order, heading-depth nesting growing unbounded, a person's name incorrectly fused with a trailing fragment, list items dropped because they're nested inside Docling group containers). Each fixture is a small synthetic `DoclingDocument`-shaped JSON, not a full PDF, so the suite runs in a couple seconds.
+
+Runs automatically on every push/PR via [`.github/workflows/tests.yml`](.github/workflows/tests.yml) (GitHub Actions, free tier — no other CI setup needed).

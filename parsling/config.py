@@ -8,7 +8,7 @@ Granite-Docling-258M handles the entire conversion.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 
@@ -85,6 +85,14 @@ class ParseProfile:
     num_threads:
         Number of CPU threads for model inference.
 
+    page_batch_size:
+        Number of pages processed together as one batch through the OCR/
+        layout/table models. Higher = more throughput, more peak VRAM.
+        Lower this (e.g. to 1-2) on GPUs with limited memory to avoid
+        CUDA OOM — especially with ``table_mode="accurate"`` and
+        ``do_chart_extraction=True``, which already keep several large
+        models resident on the GPU at once.
+
     artifacts_path:
         Optional path to a local directory with pre-downloaded model
         weights. Set this for air-gapped / offline environments.
@@ -118,6 +126,11 @@ class ParseProfile:
     # Hardware
     accelerator: Literal["cpu", "cuda", "mps"] = "cpu"
     num_threads: int = 4
+    page_batch_size: int = 4
 
     # Offline model cache
     artifacts_path: str | None = None
+
+    def with_device(self, accelerator: Literal["cpu", "cuda", "mps"]) -> "ParseProfile":
+        """Return a copy of this profile targeting a different accelerator."""
+        return replace(self, accelerator=accelerator)

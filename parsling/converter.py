@@ -13,7 +13,7 @@ Supported profiles (by name string or ParseProfile instance):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator
 
@@ -79,12 +79,26 @@ def _resolve_profile(profile: ParseProfile | str) -> ParseProfile:
     return profile
 
 
+def _apply_perf_settings(profile: ParseProfile) -> None:
+    """Apply global Docling perf settings (page_batch_size lives outside
+    PdfPipelineOptions — it's a process-wide knob on docling.datamodel.settings)."""
+    from docling.datamodel.settings import settings as docling_settings
+    docling_settings.perf.page_batch_size = profile.page_batch_size
+
+
 def _build_accelerator(profile: ParseProfile) -> AcceleratorOptions:
     device_map = {
         "cpu": AcceleratorDevice.CPU,
         "cuda": AcceleratorDevice.CUDA,
         "mps": AcceleratorDevice.MPS,
     }
+    if profile.accelerator == "cuda":
+        # Allow TF32 tensor cores on Ampere+ GPUs — free speedup for the
+        # float32 matmuls in TableFormer/EasyOCR/Granite Vision, negligible
+        # precision loss for these models.
+        import torch
+        torch.set_float32_matmul_precision("high")
+
     return AcceleratorOptions(
         num_threads=profile.num_threads,
         device=device_map.get(profile.accelerator, AcceleratorDevice.CPU),
@@ -99,9 +113,10 @@ def _build_standard_converter(profile: ParseProfile) -> DocumentConverter:
     pipeline_options.do_ocr = profile.do_ocr
     if profile.do_ocr:
         if profile.ocr_engine == "easyocr":
+            # use_gpu is deprecated in favor of accelerator_options.device
+            # (set below via pipeline_options.accelerator_options).
             pipeline_options.ocr_options = EasyOcrOptions(
                 lang=profile.ocr_langs,
-                use_gpu=(profile.accelerator != "cpu"),
                 force_full_page_ocr=False,
             )
         else:
@@ -205,8 +220,27 @@ class PdfParser:
         results = list(parser.parse_folder(Path("./pdfs/")))
     """
 
-    def __init__(self, profile: ParseProfile | str = "accurate") -> None:
+    def __init__(
+        self,
+        profile: ParseProfile | str = "accurate",
+        device: str | None = None,
+        page_batch_size: int | None = None,
+        do_formula_enrichment: bool | None = None,
+        do_code_enrichment: bool | None = None,
+        do_chart_extraction: bool | None = None,
+    ) -> None:
         self.profile = _resolve_profile(profile)
+        if device is not None:
+            self.profile = self.profile.with_device(device)
+        if page_batch_size is not None:
+            self.profile = replace(self.profile, page_batch_size=page_batch_size)
+        if do_formula_enrichment is not None:
+            self.profile = replace(self.profile, do_formula_enrichment=do_formula_enrichment)
+        if do_code_enrichment is not None:
+            self.profile = replace(self.profile, do_code_enrichment=do_code_enrichment)
+        if do_chart_extraction is not None:
+            self.profile = replace(self.profile, do_chart_extraction=do_chart_extraction)
+        _apply_perf_settings(self.profile)
         self._converter = (
             _build_vlm_converter(self.profile)
             if self.profile.use_vlm
